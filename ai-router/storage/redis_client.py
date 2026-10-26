@@ -17,11 +17,19 @@ class RedisMemory:
         host: str = "localhost",
         port: int = 6379,
         db: int = 0,
+        password: str | None = None,
+        client: redis.Redis | None = None,
     ) -> None:
-        self.client = redis.Redis(
-            host=host, port=port, db=db, decode_responses=True
+        self.client = client or redis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            password=password,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=10,
         )
-        logger.info("Connected to Redis at %s:%d/%d", host, port, db)
+        logger.info("Redis client configured for %s:%d/%d", host, port, db)
 
     def save_state(self, user_id: str, state: dict[str, Any]) -> None:
         key = f"state:{user_id}"
@@ -33,7 +41,12 @@ class RedisMemory:
         data = self.client.get(key)
         if data is None:
             return {}
-        return json.loads(data)
+        try:
+            state = json.loads(data)
+        except ValueError:
+            logger.warning("Corrupted state for %s, resetting", user_id)
+            return {}
+        return state if isinstance(state, dict) else {}
 
     def update_memory(self, user_id: str, new_info: dict[str, Any]) -> None:
         state = self.load_state(user_id)
@@ -47,6 +60,6 @@ class RedisMemory:
 
     def ping(self) -> bool:
         try:
-            return self.client.ping()
-        except redis.ConnectionError:
+            return bool(self.client.ping())
+        except redis.RedisError:
             return False

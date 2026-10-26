@@ -7,8 +7,7 @@ from core.compressor import semantic_compress
 
 if TYPE_CHECKING:
     from core.llm import LLM
-
-from storage.redis_client import RedisMemory
+    from storage.redis_client import RedisMemory
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +33,8 @@ class StateManager:
         self, llm: LLM, user_id: str, conversation: str
     ) -> None:
         """Compress a conversation and store the summary in state."""
-        summary = semantic_compress(llm, conversation)
+        previous = self.load_state(user_id).get("last_summary", "")
+        text = f"{previous}\n\n{conversation}" if previous else conversation
+        summary = semantic_compress(llm, text, force=True)
         self.update_memory(user_id, {"last_summary": summary})
         logger.info("Stored compressed summary for user %s", user_id)

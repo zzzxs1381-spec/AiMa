@@ -10,6 +10,7 @@ Each probe returns a `ProbeReport` with `block_type` filled in.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import socket
 import ssl
 import time
@@ -70,6 +71,24 @@ def _classify_socket_error(exc: BaseException) -> BlockType:
 # ─── Individual probes ──────────────────────────────────────────────────────
 
 
+def _is_poisoned_answer(address: str) -> bool:
+    """Sinkhole / stub answers typical for DPI DNS poisoning and fake-ip resolvers."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return (
+        ip.is_unspecified
+        or ip.is_loopback
+        or ip.is_private
+        or ip.is_reserved
+        or ip in _FAKE_IP_NET
+    )
+
+
+_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+
+
 async def probe_dns(profile: ProbeProfile, vantage: Vantage) -> ProbeReport:
     started = utcnow()
     t0 = _now_ms()
@@ -78,6 +97,8 @@ async def probe_dns(profile: ProbeProfile, vantage: Vantage) -> ProbeReport:
     try:
         ans = await resolver.resolve(profile.host, "A")
         addresses = [r.to_text() for r in ans]
+        poisoned = bool(addresses) and all(_is_poisoned_answer(a) for a in addresses)
+        ok = bool(addresses) and not poisoned
         return ProbeReport(
             profile_id=profile.id,
             vantage=vantage.name,
@@ -86,10 +107,11 @@ async def probe_dns(profile: ProbeProfile, vantage: Vantage) -> ProbeReport:
             region=vantage.region,
             started_at=started.replace(tzinfo=UTC),
             duration_ms=_now_ms() - t0,
-            success=bool(addresses),
-            block_type=BlockType.NONE if addresses else BlockType.DNS_BLOCK,
+            success=ok,
+            block_type=BlockType.NONE if ok else BlockType.DNS_BLOCK,
             rtt_ms=_now_ms() - t0,
-            raw={"addresses": addresses},
+            error="poisoned DNS answer (sinkhole/fake-ip)" if poisoned else None,
+            raw={"addresses": addresses, "poisoned": poisoned},
         )
     except (dns.exception.DNSException, OSError) as exc:
         return ProbeReport(

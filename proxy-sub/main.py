@@ -7,14 +7,14 @@ Supports LTE/3G/Wi-Fi with auto-switching
 import asyncio
 import base64
 import hashlib
+import os
 import pathlib
-import re
 import time
 from datetime import datetime, timezone
-from urllib.parse import unquote, urlparse, parse_qs
+from urllib.parse import unquote
 
 import httpx
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -93,7 +93,6 @@ def parse_vless(line: str) -> dict | None:
         flow = params.get("flow", "")
         sni = params.get("sni", "")
         fp = params.get("fp", "")
-        alpn = params.get("alpn", "")
         pbk = params.get("pbk", "")
         sid = params.get("sid", "")
 
@@ -103,8 +102,6 @@ def parse_vless(line: str) -> dict | None:
         is_tls = security == "tls"
         is_ws = transport == "ws"
         is_grpc = transport == "grpc"
-        is_tcp = transport == "tcp"
-        is_xhttp = transport == "xhttp"
 
         # Calculate quality score
         score = 0
@@ -198,8 +195,10 @@ def parse_ss(line: str) -> dict | None:
                 decoded = base64.urlsafe_b64decode(encoded_part + "=" * padding).decode()
                 method, password = decoded.split(":", 1)
             except Exception:
-                method = "unknown"
-                password = encoded_part
+                plain = unquote(encoded_part)
+                if ":" not in plain:
+                    return None
+                method, password = plain.split(":", 1)
         else:
             # Fully base64 encoded
             try:
@@ -214,9 +213,10 @@ def parse_ss(line: str) -> dict | None:
                 return None
 
         # Parse host:port
+        server_part = server_part.split("?")[0].split("/")[0]
         if ":" in server_part:
             host, port_str = server_part.rsplit(":", 1)
-            port_str = port_str.split("?")[0].split("#")[0]
+            host = host.strip("[]")
             port = int(port_str)
         else:
             return None
@@ -249,11 +249,42 @@ def parse_ss(line: str) -> dict | None:
         return None
 
 
-async def fetch_configs() -> list[dict]:
-    """Fetch configs from all sources, parse and deduplicate."""
-    now = time.time()
-    if _cache["configs"] is not None and len(_cache["configs"]) >= 0 and _cache["last_update"] > 0 and (now - _cache["last_update"]) < CACHE_TTL:
+_fetch_lock = asyncio.Lock()
+PROTO_PREFIXES = ("vless://", "ss://", "vmess://", "trojan://")
+
+
+def decode_source(text: str) -> str:
+    """Return plain-text config list; base64-decode the source if needed."""
+    text = text.lstrip("\ufeff").strip()
+    if text.startswith(PROTO_PREFIXES) or text.startswith("//"):
+        return text
+    try:
+        compact = "".join(text.split())
+        padding = (4 - len(compact) % 4) % 4
+        decoded = base64.b64decode(compact + "=" * padding).decode("utf-8", errors="ignore").strip()
+        if decoded.startswith(PROTO_PREFIXES):
+            return decoded
+    except Exception:
+        pass
+    return text
+
+
+def _cache_fresh(now: float) -> bool:
+    return _cache["last_update"] > 0 and (now - _cache["last_update"]) < CACHE_TTL
+
+
+async def fetch_configs(force: bool = False) -> list[dict]:
+    """Fetch configs from all sources, parse and deduplicate (cached, single-flight)."""
+    if not force and _cache_fresh(time.time()):
         return _cache["configs"]
+    async with _fetch_lock:
+        if not force and _cache_fresh(time.time()):
+            return _cache["configs"]
+        return await _fetch_configs_uncached()
+
+
+async def _fetch_configs_uncached() -> list[dict]:
+    now = time.time()
 
     all_lines = []
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
@@ -266,17 +297,7 @@ async def fetch_configs() -> list[dict]:
             if isinstance(result, Exception):
                 continue
             if result.status_code == 200:
-                text = result.text
-                # Try base64 decode if it looks encoded
-                if not any(text.startswith(p) for p in ["vless://", "ss://", "vmess://", "trojan://", "//"]):
-                    try:
-                        padding = (4 - len(text.strip()) % 4) % 4
-                        decoded = base64.b64decode(text.strip() + "=" * padding).decode("utf-8", errors="ignore")
-                        if any(decoded.startswith(p) for p in ["vless://", "ss://", "vmess://", "trojan://"]):
-                            text = decoded
-                    except Exception:
-                        pass
-                all_lines.extend(text.splitlines())
+                all_lines.extend(decode_source(result.text).splitlines())
 
     # Parse all configs
     configs = []
@@ -299,8 +320,12 @@ async def fetch_configs() -> list[dict]:
     # Sort by score descending
     configs.sort(key=lambda x: x["score"], reverse=True)
 
+    if not configs and _cache["configs"]:
+        # All sources failed: keep serving the previous good list, retry soon.
+        _cache["last_update"] = now - CACHE_TTL + 60
+        return _cache["configs"]
     _cache["configs"] = configs
-    _cache["last_update"] = now
+    _cache["last_update"] = now if configs else 0
 
     return configs
 
@@ -402,14 +427,15 @@ async def root():
             "/sub/wifi": "Wi-Fi shortcut",
             "/sub/best": "Top 20 best scoring configs",
             "/stats": "Stats about available configs",
+            "/probe": "Real TCP latency probe of top configs",
         },
     }
 
 
 @app.get("/sub")
 async def subscription(
-    network: str = Query("all", description="Network type: all, lte, 3g, wifi"),
-    max: int = Query(50, description="Max configs to return"),
+    network: str = Query("all", pattern="^(all|lte|3g|wifi)$", description="Network type: all, lte, 3g, wifi"),
+    max: int = Query(50, ge=1, le=1000, description="Max configs to return"),
     ports: str = Query("", description="Comma-separated port filter"),
 ):
     configs = await fetch_configs()
@@ -451,7 +477,7 @@ async def stats():
     configs = await fetch_configs()
     total = len(configs)
     reality = sum(1 for c in configs if c.get("is_reality"))
-    vision = sum(1 for c in configs if c.get("is_vision"))
+    vision = sum(1 for c in configs if c.get("is_reality") and c.get("is_vision"))
     ws_tls = sum(1 for c in configs if c.get("is_ws") and c.get("is_tls"))
     grpc = sum(1 for c in configs if c.get("is_grpc"))
     ss = sum(1 for c in configs if c.get("type") == "ss")
@@ -487,11 +513,72 @@ async def stats():
 
 
 @app.post("/refresh")
-async def refresh_cache():
-    """Force refresh config cache."""
-    _cache["last_update"] = 0
-    configs = await fetch_configs()
+async def refresh_cache(x_refresh_token: str | None = Header(None)):
+    """Force refresh config cache. Protected by REFRESH_TOKEN if it is set."""
+    expected = os.getenv("REFRESH_TOKEN", "")
+    if expected and x_refresh_token != expected:
+        raise HTTPException(status_code=403, detail="invalid refresh token")
+    configs = await fetch_configs(force=True)
     return {"status": "ok", "total_configs": len(configs)}
+
+
+async def tcp_ping(host: str, port: int, timeout: float = 3.0) -> float | None:
+    """Real TCP connect latency in ms, or None if unreachable."""
+    start = time.perf_counter()
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    except (OSError, asyncio.TimeoutError):
+        return None
+    elapsed = (time.perf_counter() - start) * 1000
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return round(elapsed, 1)
+
+
+def config_kind(c: dict) -> str:
+    if c.get("type") == "ss":
+        return "SS"
+    if c.get("is_reality"):
+        return "REALITY"
+    if c.get("is_grpc"):
+        return "gRPC"
+    if c.get("is_ws") and c.get("is_tls"):
+        return "WS/TLS"
+    return "VLESS"
+
+
+@app.get("/probe")
+async def probe(limit: int = Query(24, ge=1, le=100), network: str = Query("all", pattern="^(all|lte|3g|wifi)$")):
+    """TCP-probe the top configs from the server side and return real latencies."""
+    configs = await fetch_configs()
+    if network != "all":
+        configs = [c for c in configs if c["best_for"] == network]
+    sample = configs[:limit]
+    latencies = await asyncio.gather(*(tcp_ping(c["host"], c["port"]) for c in sample))
+    results = [
+        {
+            "host": c["host"],
+            "port": c["port"],
+            "sni": c.get("sni", ""),
+            "kind": config_kind(c),
+            "name": c.get("name", ""),
+            "latency_ms": lat,
+            "online": lat is not None,
+        }
+        for c, lat in zip(sample, latencies, strict=True)
+    ]
+    online = [r for r in results if r["online"]]
+    return {
+        "tested": len(results),
+        "online": len(online),
+        "offline": len(results) - len(online),
+        "avg_latency_ms": round(sum(r["latency_ms"] for r in online) / len(online), 1) if online else None,
+        "port_443_reachable": any(r["port"] == 443 for r in online),
+        "results": results,
+    }
 
 
 # Serve static webapp files

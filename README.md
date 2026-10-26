@@ -82,3 +82,18 @@ python main.py
 - **OpenRouter integration**: Access to multiple LLM providers through a single API
 - **Fallback chain**: Automatic failover across models if one is unavailable
 - **Batch processing**: Queue and merge multiple requests for efficiency
+
+### Task system (ai-router)
+
+`python main.py serve` starts an HTTP API (default `127.0.0.1:8080`) plus background workers backed by Redis.
+
+- Assign a task to one agent (`agent`), to several agents individually (`agents`), or to a pair (`pair_id`: worker + reviewer iterate until `APPROVED` or `max_rounds`).
+- Priorities `low|medium|high|critical` drive a Redis priority queue (FIFO within a priority).
+- Statuses: `pending → queued → running/review → done | failed | cancelled | timed_out`, plus `retry_wait`.
+- Deadlines, per-attempt timeouts, retries with exponential backoff, dependencies (results are passed downstream, failures cascade, cycles rejected).
+- Comments, per-task history, global activity log (`/events`), unread notifications, per-agent overview (`/agents`).
+- Endpoints: `POST/GET /tasks`, `GET/PATCH/DELETE /tasks/{id}`, `POST /tasks/{id}/cancel|retry|read|comments`, `GET /tasks/{id}/history`, `GET /tasks/stats`, `GET/POST /pairs`, `GET/PATCH/DELETE /pairs/{id}`, `GET /agents`, `GET /events`.
+- Filters on `GET /tasks`: `status`, `priority`, `agent`, `pair_id`, `tag`, `q`, `unread`, `overdue`, `sort`, `order`, `limit`, `offset`.
+- Permissions: set `AI_ROUTER_API_TOKEN` (writes) and optionally `AI_ROUTER_READ_TOKEN` (reads); pass as `X-API-Key`.
+
+Tests: `cd ai-router && pip install -r requirements-dev.txt && pytest`.

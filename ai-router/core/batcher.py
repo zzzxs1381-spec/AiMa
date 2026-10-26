@@ -28,15 +28,19 @@ class BatchQueue:
             if not self._queue:
                 return ""
 
-            batch_prompt = "\n\n---\n\n".join(self._queue)
+            # Take a snapshot and detach it, so requests added while the LLM call
+            # is in flight are not silently dropped (previous code cleared them).
+            batch = self._queue
+            self._queue = []
 
-        logger.info("Flushing batch of merged requests")
-        result = llm.fallback_call(batch_prompt)
-
-        with self._lock:
-            self._queue.clear()
-
-        return result
+        batch_prompt = "\n\n---\n\n".join(batch)
+        logger.info("Flushing batch of %d merged requests", len(batch))
+        try:
+            return llm.fallback_call(batch_prompt)
+        except Exception:
+            with self._lock:
+                self._queue = batch + self._queue  # keep them for a retry
+            raise
 
     @property
     def size(self) -> int:

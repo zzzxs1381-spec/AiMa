@@ -882,9 +882,9 @@ body::before {
       <div class="shield-arrow">→</div>
       <div class="shield-col">
         <div class="shield-col-title">🟢 С прокси</div>
-        <div class="shield-item" id="shield-proxy-ip">Скрыт</div>
-        <div class="shield-item" id="shield-proxy-isp">Cloudflare</div>
-        <div class="shield-item" id="shield-proxy-loc">🌍 Мульти</div>
+        <div class="shield-item" id="shield-proxy-ip">—</div>
+        <div class="shield-item" id="shield-proxy-isp">—</div>
+        <div class="shield-item" id="shield-proxy-loc">—</div>
       </div>
     </div>
   </div>
@@ -1201,11 +1201,12 @@ function renderConfigs(lines) {
   const list = document.getElementById('config-list');
   list.innerHTML = lines.map(line => {
     const hash = line.split('#');
-    const label = hash.length > 1 ? decodeURIComponent(hash[hash.length-1]) : 'config';
+    let label = 'config';
+    if (hash.length > 1) { try { label = decodeURIComponent(hash[hash.length-1]); } catch(e) { label = hash[hash.length-1]; } }
     const isSS = line.startsWith('ss://');
     const tagClass = isSS ? 'tag-ss' : 'tag-vless';
     const tagText = isSS ? 'SS' : 'VLESS';
-    const shortLabel = label.slice(0, 35);
+    const shortLabel = escapeHtml(label.slice(0, 35));
     return `<div class="config-item"><span>${shortLabel}</span><span class="config-tag ${tagClass}">${tagText}</span></div>`;
   }).join('');
 }
@@ -1235,7 +1236,14 @@ function openInHiddify() {
 
 // === FEATURE 1: SPEED RADAR ===
 let radarData = [];
+let radarLoop = false;
 function drawRadar() {
+  if (radarLoop) return;
+  radarLoop = true;
+  radarFrame();
+}
+function radarFrame() {
+  if (currentPage !== 'radar') { radarLoop = false; return; }
   const canvas = document.getElementById('radar-canvas');
   const ctx = canvas.getContext('2d');
   const W = canvas.width = canvas.offsetWidth * 2;
@@ -1266,17 +1274,17 @@ function drawRadar() {
   if (radarData.length > 0) {
     radarData.forEach((d, i) => {
       const angle = (i / radarData.length) * Math.PI * 2 - Math.PI / 2;
-      const r = Math.min(d.latency / 500, 1) * maxR;
+      const r = d.latency == null ? maxR : Math.min(d.latency / 500, 1) * maxR;
       const x = cx + Math.cos(angle) * r;
       const y = cy + Math.sin(angle) * r;
-      const color = d.latency < 100 ? '#00d68f' : d.latency < 300 ? '#ffb347' : '#ff5a5a';
+      const color = d.latency == null ? '#ff5a5a' : d.latency < 100 ? '#00d68f' : d.latency < 300 ? '#ffb347' : '#ff5a5a';
       ctx.beginPath();
       ctx.arc(x, y, 6, 0, Math.PI * 2);
       ctx.fillStyle = color;
       ctx.fill();
       ctx.beginPath();
       ctx.arc(x, y, 10, 0, Math.PI * 2);
-      ctx.fillStyle = color.replace(')', ',0.2)').replace('rgb', 'rgba');
+      ctx.fillStyle = color + '33';
       ctx.fill();
     });
   }
@@ -1291,64 +1299,48 @@ function drawRadar() {
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  requestAnimationFrame(drawRadar);
+  requestAnimationFrame(radarFrame);
 }
 
+let probeData = null;
+async function loadProbe(limit = 24) {
+  const resp = await fetch(`${API}/probe?limit=${limit}`);
+  if (!resp.ok) throw new Error('probe failed');
+  probeData = await resp.json();
+  return probeData;
+}
 async function runSpeedTest() {
   showToast('⚡ Тестирование конфигов...');
-  radarData = [];
-
   try {
-    const resp = await fetch(`${API}/stats`);
-    const data = await resp.json();
-
-    // Simulate speed tests for different config types
-    const types = [
-      {name: 'REALITY', count: data.by_type.reality, basePing: 45},
-      {name: 'WS/TLS', count: data.by_type.ws_tls, basePing: 80},
-      {name: 'gRPC', count: data.by_type.grpc || 0, basePing: 60},
-      {name: 'SS', count: data.by_type.shadowsocks, basePing: 70},
-    ];
-
-    let totalPing = 0, fastCount = 0, deadCount = 0;
-    const bars = [];
-
-    for (const t of types) {
-      const sampleSize = Math.min(t.count, 8);
-      for (let i = 0; i < sampleSize; i++) {
-        const latency = t.basePing + Math.random() * 200;
-        const jitter = Math.random() * 30;
-        radarData.push({name: `${t.name}-${i+1}`, latency, jitter});
-        totalPing += latency;
-        if (latency < 150) fastCount++;
-        if (latency > 400) deadCount++;
-      }
-      bars.push({name: t.name, latency: t.basePing + Math.random() * 50, count: t.count});
-    }
-
-    const avgPing = Math.round(totalPing / radarData.length);
-    document.getElementById('radar-ping').textContent = avgPing;
-    document.getElementById('radar-fast').textContent = fastCount;
-    document.getElementById('radar-online').textContent = radarData.length - deadCount;
-    document.getElementById('radar-dead').textContent = deadCount;
-
-    // Render speed bars
-    const barsHtml = bars.map(b => {
+    const data = await loadProbe(24);
+    radarData = data.results.map(r => ({name: `${r.kind} ${r.host}:${r.port}`, latency: r.latency_ms}));
+    const fast = data.results.filter(r => r.online && r.latency_ms < 150).length;
+    document.getElementById('radar-ping').textContent = data.avg_latency_ms != null ? Math.round(data.avg_latency_ms) : '—';
+    document.getElementById('radar-fast').textContent = fast;
+    document.getElementById('radar-online').textContent = data.online;
+    document.getElementById('radar-dead').textContent = data.offline;
+    const byKind = {};
+    data.results.filter(r => r.online).forEach(r => {
+      (byKind[r.kind] = byKind[r.kind] || []).push(r.latency_ms);
+    });
+    const bars = Object.entries(byKind).map(([name, l]) => ({name, latency: l.reduce((a, b) => a + b, 0) / l.length}));
+    document.getElementById('speed-bars').innerHTML = bars.length ? bars.map(b => {
       const pct = Math.max(10, 100 - (b.latency / 3));
       return `<div class="speed-bar-item">
-        <span class="speed-bar-name">${b.name}</span>
+        <span class="speed-bar-name">${escapeHtml(b.name)}</span>
         <div class="speed-bar-track"><div class="speed-bar-fill" style="width:${pct}%"></div></div>
         <span class="speed-bar-val">${Math.round(b.latency)} мс</span>
       </div>`;
-    }).join('');
-    document.getElementById('speed-bars').innerHTML = barsHtml;
-
+    }).join('') : '<p style="color:var(--text2);text-align:center">Нет доступных конфигов</p>';
+    renderMixer();
     showToast('✓ Тест завершён');
   } catch(e) {
     showToast('Ошибка тестирования');
   }
 }
-
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 // === FEATURE 2: GEO SHIELD ===
 function drawShieldRing() {
   const canvas = document.getElementById('shield-canvas');
@@ -1367,7 +1359,7 @@ function drawShieldRing() {
   ctx.stroke();
 
   // Score ring
-  const score = 92;
+  const score = shieldScore();
   const endAngle = -Math.PI/2 + (score/100) * Math.PI * 2;
   ctx.beginPath();
   ctx.arc(cx, cy, r, -Math.PI/2, endAngle);
@@ -1395,22 +1387,70 @@ async function initGeoShield() {
     document.getElementById('shield-real-ip').textContent = 'Не определён';
   }
 
+  await renderShieldChecks();
+}
+let shieldChecks = [];
+function shieldScore() {
+  if (!shieldChecks.length) return 0;
+  const pts = shieldChecks.reduce((a, c) => a + (c.status === 'pass' ? 1 : c.status === 'warn' ? 0.5 : 0), 0);
+  return Math.round(pts / shieldChecks.length * 100);
+}
+async function detectWebRTCLeak() {
+  if (!window.RTCPeerConnection) return {status: 'pass', detail: 'WebRTC отключён'};
+  return new Promise(resolve => {
+    const ips = new Set();
+    let pc;
+    try { pc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]}); }
+    catch(e) { resolve({status: 'pass', detail: 'WebRTC недоступен'}); return; }
+    pc.createDataChannel('x');
+    pc.onicecandidate = e => {
+      if (!e.candidate) return;
+      const m = e.candidate.candidate.match(/(\d{1,3}(?:\.\d{1,3}){3})/);
+      if (m && / srflx /.test(e.candidate.candidate)) ips.add(m[1]);
+    };
+    pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => {});
+    setTimeout(() => {
+      pc.close();
+      resolve(ips.size ? {status: 'warn', detail: `Публичный IP виден: ${[...ips][0]}`} : {status: 'pass', detail: 'Публичный IP не раскрыт'});
+    }, 2500);
+  });
+}
+async function detectIPv6() {
+  try {
+    const r = await fetch('https://api64.ipify.org?format=json');
+    const ip = (await r.json()).ip || '';
+    return ip.includes(':') ? {status: 'warn', detail: 'IPv6 активен — возможна утечка'} : {status: 'pass', detail: 'Трафик идёт по IPv4'};
+  } catch(e) { return {status: 'warn', detail: 'Не удалось проверить'}; }
+}
+async function renderShieldChecks() {
+  const stats = statsData || {by_type: {}, total_configs: 0};
+  const reality = stats.by_type.reality || 0;
   const checks = [
-    {name: 'DPI-обход', status: 'pass', detail: 'REALITY маскировка активна'},
-    {name: 'DNS-утечка', status: 'pass', detail: 'DNS через прокси'},
-    {name: 'WebRTC-утечка', status: 'warn', detail: 'Зависит от браузера'},
-    {name: 'Fingerprint', status: 'pass', detail: 'TLS 1.3, Chrome FP'},
-    {name: 'IPv6-утечка', status: 'pass', detail: 'IPv6 заблокирован'},
-    {name: 'Блокировка оператором', status: 'pass', detail: 'Порт 443 открыт'},
+    {name: 'DPI-обход', ...(reality > 0 ? {status: 'pass', detail: `${reality} REALITY-конфигов`} : {status: 'fail', detail: 'Нет REALITY-конфигов'})},
+    {name: 'WebRTC-утечка', ...(await detectWebRTCLeak())},
+    {name: 'IPv6-утечка', ...(await detectIPv6())},
   ];
-
+  try {
+    const p = probeData || await loadProbe(12);
+    const best = p.results.filter(r => r.online).sort((x, y) => x.latency_ms - y.latency_ms)[0];
+    document.getElementById('shield-proxy-ip').textContent = best ? best.host : 'Нет узлов';
+    document.getElementById('shield-proxy-isp').textContent = best ? `${best.kind} · ${Math.round(best.latency_ms)} мс` : '—';
+    document.getElementById('shield-proxy-loc').textContent = `🌍 ${p.online} узлов онлайн`;
+    checks.push({name: 'Блокировка оператором', ...(p.port_443_reachable
+      ? {status: 'pass', detail: `Порт 443 доступен (${p.online}/${p.tested} онлайн)`}
+      : {status: 'fail', detail: `Порт 443 недоступен (${p.online}/${p.tested} онлайн)`})});
+  } catch(e) {
+    checks.push({name: 'Блокировка оператором', status: 'warn', detail: 'Проверка не удалась'});
+  }
+  shieldChecks = checks;
+  if (currentPage === 'shield') drawShieldRing();
   document.getElementById('shield-checks').innerHTML = checks.map(c => {
     const icon = c.status === 'pass' ? '✓' : c.status === 'warn' ? '⚠' : '✗';
     const cls = `check-${c.status}`;
     return `<div class="shield-check">
       <span class="check-icon ${cls}">${icon}</span>
       <span style="flex:1">${c.name}</span>
-      <span style="font-size:11px;color:var(--text2)">${c.detail}</span>
+      <span style="font-size:11px;color:var(--text2)">${escapeHtml(c.detail)}</span>
     </div>`;
   }).join('');
 }
@@ -1446,35 +1486,36 @@ function initSmartDNA() {
 }
 
 // === FEATURE 4: CONFIG MIXER ===
-function initMixer() {
-  const configs = [
-    {flag: '🇷🇺', name: 'yandex.ru', ping: '42 мс'},
-    {flag: '🇳🇱', name: 'cloudflare', ping: '68 мс'},
-    {flag: '🇩🇪', name: 'microsoft', ping: '85 мс'},
-    {flag: '🇺🇸', name: 'google.com', ping: '120 мс'},
-    {flag: '🇫🇮', name: 'amazon.com', ping: '95 мс'},
-  ];
-
+let mixerTimer = null;
+function renderMixer() {
   const chain = document.getElementById('mixer-chain');
-  chain.innerHTML = configs.map((c, i) => {
-    const arrow = i < configs.length - 1 ? '<span class="mixer-arrow">→</span>' : '';
+  const nodes = (probeData?.results || []).filter(r => r.online).sort((a, b) => a.latency_ms - b.latency_ms).slice(0, 5);
+  if (!nodes.length) {
+    chain.innerHTML = '<p style="color:var(--text2);text-align:center">Запусти тест на Радаре, чтобы собрать цепочку</p>';
+    return;
+  }
+  chain.innerHTML = nodes.map((c, i) => {
+    const arrow = i < nodes.length - 1 ? '<span class="mixer-arrow">→</span>' : '';
     return `<div class="mixer-node ${i === 0 ? 'active-node' : ''}">
-      <div class="node-flag">${c.flag}</div>
-      <div class="node-ping">${c.ping}</div>
-      <div class="node-name">${c.name}</div>
+      <div class="node-flag">${escapeHtml(c.kind)}</div>
+      <div class="node-ping">${Math.round(c.latency_ms)} мс</div>
+      <div class="node-name">${escapeHtml((c.sni || c.host).slice(0, 18))}</div>
     </div>${arrow}`;
   }).join('');
-
-  // Animate active node
+}
+function initMixer() {
+  renderMixer();
   let activeIdx = 0;
-  setInterval(() => {
+  if (mixerTimer) clearInterval(mixerTimer);
+  mixerTimer = setInterval(() => {
+    if (!getSetting('toggle-rotate', true)) return;
     const nodes = document.querySelectorAll('.mixer-node');
+    if (!nodes.length) return;
     nodes.forEach(n => n.classList.remove('active-node'));
     activeIdx = (activeIdx + 1) % nodes.length;
     nodes[activeIdx].classList.add('active-node');
   }, 3000);
 }
-
 // === ROUTES ===
 function toggleRoute(card) {
   const status = card.querySelector('.route-status');
@@ -1490,7 +1531,25 @@ function toggleRoute(card) {
     status.textContent = 'ВКЛ';
     card.classList.add('active-route');
   }
+  saveRoutes();
   showToast('✓ Маршрут обновлён');
+}
+function saveRoutes() {
+  const state = [...document.querySelectorAll('#routes-list .route-card')].map(c => c.classList.contains('active-route'));
+  localStorage.setItem('xshield-routes', JSON.stringify(state));
+}
+function restoreRoutes() {
+  let state;
+  try { state = JSON.parse(localStorage.getItem('xshield-routes') || 'null'); } catch(e) { state = null; }
+  if (!Array.isArray(state)) return;
+  document.querySelectorAll('#routes-list .route-card').forEach((card, i) => {
+    const on = !!state[i];
+    const st = card.querySelector('.route-status');
+    card.classList.toggle('active-route', on);
+    st.classList.toggle('route-on', on);
+    st.classList.toggle('route-off', !on);
+    st.textContent = on ? 'ВКЛ' : 'ВЫКЛ';
+  });
 }
 
 // === THEME ===
@@ -1512,13 +1571,25 @@ function setTheme(theme) {
 // === TOGGLE ===
 function toggleSetting(el) {
   el.classList.toggle('on');
+  if (el.id) localStorage.setItem(`xshield-${el.id}`, el.classList.contains('on') ? '1' : '0');
+}
+function getSetting(id, def) {
+  const v = localStorage.getItem(`xshield-${id}`);
+  return v === null ? def : v === '1';
+}
+function restoreSettings() {
+  document.querySelectorAll('.toggle[id]').forEach(el => {
+    el.classList.toggle('on', getSetting(el.id, el.classList.contains('on')));
+  });
 }
 
 // === REFRESH ===
 async function refreshAll() {
   showToast('🔄 Обновляю конфиги...');
   try {
-    await fetch(`${API}/refresh`, {method: 'POST'});
+    const r = await fetch(`${API}/refresh`, {method: 'POST'});
+    if (!r.ok) throw new Error('refresh failed');
+    probeData = null;
     const resp = await fetch(`${API}/stats`);
     statsData = await resp.json();
     renderHome(statsData);
@@ -1537,6 +1608,8 @@ function showToast(msg) {
 }
 
 // === START ===
+restoreRoutes();
+restoreSettings();
 init();
 </script>
 </body>

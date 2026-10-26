@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -46,10 +47,13 @@ SNI_POOLS: list[list[str]] = [
 ]
 
 
-CDN_FRONT_HOSTS: list[str] = [
-    "ws.aima-cdn.workers.dev",  # placeholder — user provides real CF Worker host
-    "edge-fronting.aima.example",
-]
+def _front_hosts_from_env() -> list[str]:
+    """Real CDN front hosts (e.g. your CF Worker domain), comma-separated in AIMA_CDN_FRONT_HOSTS."""
+    raw = os.environ.get("AIMA_CDN_FRONT_HOSTS", "")
+    return [h.strip() for h in raw.split(",") if h.strip()]
+
+
+CDN_FRONT_HOSTS: list[str] = _front_hosts_from_env()
 
 
 ALT_PORTS: list[int] = [443, 8443, 2053, 2083, 2087, 2096]
@@ -352,16 +356,23 @@ async def activate_backup_inbound(inbound: dict, ctx: RecipeContext) -> RecipeRe
 
 @register("fallback_cdn_ws")
 async def fallback_cdn_ws(inbound: dict, ctx: RecipeContext) -> RecipeResult:
+    fronts = [h for h in (CDN_FRONT_HOSTS or _front_hosts_from_env()) if h not in ctx.exhaust_fronts]
+    if not fronts:
+        return RecipeResult(
+            changed=False,
+            inbound=inbound,
+            notes="no CDN front host configured (set AIMA_CDN_FRONT_HOSTS) or all exhausted",
+        )
     settings = _stream_settings(inbound)
     settings["network"] = "ws"
     settings["wsSettings"] = {
         "path": f"/aima/{secrets.token_urlsafe(6)}",
-        "headers": {"Host": CDN_FRONT_HOSTS[0]},
+        "headers": {"Host": fronts[0]},
     }
     return RecipeResult(
         changed=True,
         inbound=_put_stream_settings(inbound, settings),
-        notes="fallback to CDN-WS over CF",
+        notes=f"fallback to CDN-WS via {fronts[0]}",
         renderer_overrides={"prefer_cdn_ws": True, "force_resub": True},
     )
 

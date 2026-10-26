@@ -107,13 +107,24 @@ async def test_regenerate_short_ids_produces_unique_hex() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fallback_cdn_ws_rewrites_transport() -> None:
+async def test_fallback_cdn_ws_rewrites_transport(monkeypatch) -> None:
+    monkeypatch.setenv("AIMA_CDN_FRONT_HOSTS", "edge.example.workers.dev")
     ib = _reality_inbound()
     res = await get_handler("fallback_cdn_ws")(ib, RecipeContext(block_type=BlockType.SNI_BLOCK))
     assert res.changed
     s = _stream(res.inbound)
     assert s["network"] == "ws"
     assert s["wsSettings"]["path"].startswith("/aima/")
+    assert s["wsSettings"]["headers"]["Host"] == "edge.example.workers.dev"
+
+
+@pytest.mark.asyncio
+async def test_fallback_cdn_ws_without_front_host_is_noop(monkeypatch) -> None:
+    monkeypatch.delenv("AIMA_CDN_FRONT_HOSTS", raising=False)
+    ib = _reality_inbound()
+    res = await get_handler("fallback_cdn_ws")(ib, RecipeContext(block_type=BlockType.SNI_BLOCK))
+    assert not res.changed
+    assert res.inbound == ib
 
 
 @pytest.mark.asyncio

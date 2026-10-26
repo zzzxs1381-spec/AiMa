@@ -91,3 +91,11 @@ async def test_tls_to_plain_tcp_classifies_as_sni_block() -> None:
     finally:
         server.close()
         await server.wait_closed()
+
+
+def test_poisoned_dns_answers_detected() -> None:
+    from aima.probe import _is_poisoned_answer
+
+    for addr in ("0.0.0.0", "127.0.0.1", "198.18.0.1", "10.10.34.36"):
+        assert _is_poisoned_answer(addr)
+    assert not _is_poisoned_answer("1.1.1.1")
