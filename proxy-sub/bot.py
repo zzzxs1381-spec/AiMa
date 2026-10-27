@@ -8,18 +8,21 @@ Telegram Bot for Proxy Subscription Service
 """
 
 import asyncio
-import os
 import logging
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    WebAppInfo, CallbackQuery, BotCommand,
-)
-from aiogram.enums import ParseMode
+import os
 
 import httpx
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    WebAppInfo,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -64,22 +67,43 @@ def is_public_url(url: str) -> bool:
         return True
 
 
+LINK_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "tuic://")
+
+
+def stats_extra(data: dict) -> str:
+    """Health and geography lines shared by the /stats command and the stats button."""
+    hl = data.get("health") or {}
+    lines = []
+    if hl:
+        lines.append(
+            f"✅ Живых: <b>{hl.get('alive', 0)}</b> · мёртвых: {hl.get('dead', 0)} · "
+            f"медиана: {hl.get('latency_ms_median') or '—'} мс"
+        )
+    proto = data.get("by_protocol") or {}
+    if proto:
+        lines.append("Протоколы: " + ", ".join(f"{k} {v}" for k, v in sorted(proto.items(), key=lambda kv: -kv[1])))
+    countries = data.get("by_country") or {}
+    if countries:
+        lines.append("Страны: " + ", ".join(f"{k} {v}" for k, v in list(countries.items())[:8]))
+    return "\n".join(lines)
+
+
 def user_id(obj) -> int | None:
     return obj.from_user.id if obj.from_user else None
 
 
-async def api_get(path: str) -> dict | str | None:
+async def api_get(path: str, with_headers: bool = False):
+    """GET from the local API; with ``with_headers`` returns ``(body, headers)``."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.get(f"{API_BASE}{path}")
             if resp.status_code == 200:
                 ct = resp.headers.get("content-type", "")
-                if "json" in ct:
-                    return resp.json()
-                return resp.text
+                body = resp.json() if "json" in ct and "format=" not in path else resp.text
+                return (body, resp.headers) if with_headers else body
     except Exception as e:
         logger.error(f"API error: {e}")
-    return None
+    return (None, {}) if with_headers else None
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -114,8 +138,11 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def sub_url_for(network: str) -> str:
-    return f"{public_base()}/sub/{network}"
+def sub_url_for(network: str, fmt: str = "") -> str:
+    return f"{public_base()}/sub/{network}" + (f"?format={fmt}" if fmt else "")
+
+
+FORMAT_BUTTONS = (("Clash / Mihomo", "clash"), ("sing-box", "singbox"), ("Xray JSON", "xray"))
 
 
 def sub_link_keyboard(network: str) -> InlineKeyboardMarkup:
@@ -123,6 +150,7 @@ def sub_link_keyboard(network: str) -> InlineKeyboardMarkup:
     rows = []
     if is_public_url(sub_url):
         rows.append([InlineKeyboardButton(text="🔗 Открыть ссылку подписки", url=sub_url)])
+        rows.append([InlineKeyboardButton(text=label, url=sub_url_for(network, fmt)) for label, fmt in FORMAT_BUTTONS])
     rows.append([InlineKeyboardButton(text="« Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -190,7 +218,8 @@ async def cmd_stats(message: types.Message):
         f"📡 LTE: {data['by_network']['lte']}\n"
         f"🌐 WiFi: {data['by_network']['wifi']}\n"
         f"📶 3G: {data['by_network']['3g']}\n\n"
-        f"Источников: {data['sources_count']}\n"
+        f"{stats_extra(data)}\n\n"
+        f"Источников: {data.get('sources_ok', data['sources_count'])}/{data['sources_count']} работают\n"
         f"Обновлено: {data.get('last_update') or 'N/A'}"
     )
     await message.answer(text)
@@ -198,25 +227,26 @@ async def cmd_stats(message: types.Message):
 
 async def send_subscription(message: types.Message, network: str, label: str):
     wait_msg = await message.answer(f"⏳ Загружаю {label} конфиги...")
-    path = f"/sub/{network}"
-    data = await api_get(path)
+    data, headers = await api_get(f"/sub/{network}?format=uri", with_headers=True)
     if not data:
         await wait_msg.edit_text(f"❌ Не удалось загрузить {label} конфиги")
         return
 
-    lines = [ln for ln in str(data).splitlines() if ln.startswith(("vless://", "ss://"))]
+    lines = [ln for ln in str(data).splitlines() if ln.startswith(LINK_SCHEMES)]
     count = len(lines)
+    live = headers.get("x-live-nodes", "?")
     sub_url = sub_url_for(network)
 
     text = (
         f"{label} <b>Подписка</b>\n\n"
-        f"Конфигов: <b>{count}</b>\n\n"
-        f"<b>Как добавить в Hiddify:</b>\n"
-        f"1. Открой Hiddify\n"
+        f"Узлов: <b>{count}</b> (проверено живых: <b>{live}</b>)\n\n"
+        f"<b>Как добавить:</b>\n"
+        f"1. Открой клиент (Hiddify, v2rayNG, Happ, Clash, sing-box)\n"
         f"2. Нажми + → Добавить подписку\n"
         f"3. Вставь ссылку:\n"
         f"<code>{sub_url}</code>\n\n"
-        f"Подписка обновляется каждый час автоматически."
+        f"Формат выбирается по клиенту автоматически. Кнопки ниже — прямые ссылки на Clash, sing-box и Xray JSON.\n"
+        f"Подписка обновляется каждый час, узлы перепроверяются каждые 10 минут."
     )
     await wait_msg.edit_text(text, reply_markup=sub_link_keyboard(network))
 
@@ -262,7 +292,8 @@ async def cb_stats(callback: CallbackQuery):
         f"SS: {data['by_type']['shadowsocks']}\n\n"
         f"📡 LTE: {data['by_network']['lte']} | "
         f"🌐 WiFi: {data['by_network']['wifi']} | "
-        f"📶 3G: {data['by_network']['3g']}"
+        f"📶 3G: {data['by_network']['3g']}\n\n"
+        f"{stats_extra(data)}"
     )
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Назад", callback_data="back_main")],

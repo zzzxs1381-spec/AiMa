@@ -288,6 +288,10 @@ body::before {
   position: relative;
 }
 .sub-url-box:hover { border-color: var(--accent); background: var(--bg2); }
+.fmt-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.fmt-chip { border: 1px solid var(--border, #2a2f3a); background: transparent; color: var(--text2, #9aa4b2);
+  border-radius: 14px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+.fmt-chip.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
 .copy-hint { font-size: 11px; color: var(--text3); margin-top: 6px; text-align: center; }
 
 .config-list {
@@ -812,6 +816,13 @@ body::before {
 
   <div class="sub-panel" id="sub-panel">
     <h3 id="sub-title">Подписка</h3>
+    <div class="fmt-row" id="fmt-row">
+      <button class="fmt-chip active" data-fmt="" onclick="selectFormat('')" title="Hiddify, v2rayNG, Happ, Streisand">Универсальная</button>
+      <button class="fmt-chip" data-fmt="clash" onclick="selectFormat('clash')" title="Clash Meta / Mihomo / Stash">Clash</button>
+      <button class="fmt-chip" data-fmt="singbox" onclick="selectFormat('singbox')" title="sing-box 1.12+, SFA, Karing">sing-box</button>
+      <button class="fmt-chip" data-fmt="xray" onclick="selectFormat('xray')" title="Xray JSON, v2rayN">Xray JSON</button>
+    </div>
+    <p class="copy-hint" id="live-hint"></p>
     <div class="sub-url-box" id="sub-url" onclick="copyUrl()"></div>
     <p class="copy-hint" id="copy-hint">Нажми чтобы скопировать</p>
     <div class="config-list" id="config-list"></div>
@@ -1151,7 +1162,11 @@ async function init() {
 
 function renderHome(data) {
   document.getElementById('status-title').textContent = `${data.total_configs} конфигураций`;
-  document.getElementById('status-sub').textContent = `${data.sources_count} источников · обновлено`;
+  const hl = data.health || {};
+  const okSrc = data.sources_ok ?? data.sources_count;
+  document.getElementById('status-sub').textContent = hl.alive !== undefined
+    ? `✅ ${hl.alive} живых · медиана ${hl.latency_ms_median ?? '—'} мс · ${okSrc}/${data.sources_count} источников`
+    : `${data.sources_count} источников · обновлено`;
   document.getElementById('status-count').textContent = data.total_configs;
   document.getElementById('source-badge').textContent = `${data.sources_count} источников`;
   document.getElementById('count-lte').textContent = `${data.by_network.lte} конфигов`;
@@ -1173,7 +1188,21 @@ function navigate(page) {
 }
 
 // === NETWORK SELECTION ===
+let currentNetwork = null;
+let currentFormat = '';
+
+function subUrlFor(network, fmt) {
+  return `${API}/sub/${network}` + (fmt ? `?format=${fmt}` : '');
+}
+
+function selectFormat(fmt) {
+  currentFormat = fmt;
+  document.querySelectorAll('.fmt-chip').forEach(c => c.classList.toggle('active', c.dataset.fmt === fmt));
+  if (currentNetwork) selectNetwork(currentNetwork);
+}
+
 async function selectNetwork(network) {
+  currentNetwork = network;
   document.querySelectorAll('.net-card').forEach(c => c.classList.remove('active'));
   document.querySelector(`[data-network="${network}"]`).classList.add('active');
 
@@ -1183,16 +1212,23 @@ async function selectNetwork(network) {
   const labels = {lte:'📡 LTE',wifi:'🌐 WiFi','3g':'📶 3G',best:'⚡ Лучшие'};
   document.getElementById('sub-title').textContent = `${labels[network]} Подписка`;
 
-  const subUrl = `${API}/sub/${network}`;
-  document.getElementById('sub-url').textContent = subUrl;
+  // The link the user copies carries the chosen format; the preview always asks for the readable list.
+  document.getElementById('sub-url').textContent = subUrlFor(network, currentFormat);
   document.getElementById('copy-hint').textContent = 'Нажми чтобы скопировать';
+  document.getElementById('live-hint').textContent = 'Проверяю узлы…';
 
   try {
-    const resp = await fetch(subUrl);
+    const resp = await fetch(`${API}/sub/${network}?format=uri`);
+    if (!resp.ok) throw new Error(resp.status);
     const text = await resp.text();
-    const lines = text.split('\n').filter(l => l.startsWith('vless://') || l.startsWith('ss://'));
+    const lines = text.split('\n').filter(l => /^(vless|vmess|trojan|ss|hysteria2|hy2|tuic):\/\//.test(l));
+    const live = resp.headers.get('x-live-nodes');
+    const checked = resp.headers.get('x-checked-nodes');
+    document.getElementById('live-hint').textContent =
+      `✅ ${live ?? '?'} из ${checked ?? lines.length} узлов проверены на живость · страны и флаги в названиях`;
     renderConfigs(lines.slice(0, 10));
   } catch(e) {
+    document.getElementById('live-hint').textContent = '';
     document.getElementById('config-list').innerHTML = '<p style="color:var(--red);padding:12px;text-align:center">Ошибка загрузки</p>';
   }
 }
@@ -1203,10 +1239,10 @@ function renderConfigs(lines) {
     const hash = line.split('#');
     let label = 'config';
     if (hash.length > 1) { try { label = decodeURIComponent(hash[hash.length-1]); } catch(e) { label = hash[hash.length-1]; } }
-    const isSS = line.startsWith('ss://');
-    const tagClass = isSS ? 'tag-ss' : 'tag-vless';
-    const tagText = isSS ? 'SS' : 'VLESS';
-    const shortLabel = escapeHtml(label.slice(0, 35));
+    const scheme = line.split('://')[0].toLowerCase();
+    const tagText = {ss:'SS', vless:'VLESS', vmess:'VMESS', trojan:'TROJAN', hysteria2:'HY2', hy2:'HY2', tuic:'TUIC'}[scheme] || scheme.toUpperCase();
+    const tagClass = scheme === 'ss' ? 'tag-ss' : 'tag-vless';
+    const shortLabel = escapeHtml(label.slice(0, 40));
     return `<div class="config-item"><span>${shortLabel}</span><span class="config-tag ${tagClass}">${tagText}</span></div>`;
   }).join('');
 }

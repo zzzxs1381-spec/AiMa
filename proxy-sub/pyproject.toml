@@ -10,6 +10,9 @@ dependencies = [
     "aiogram>=3.12.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyyaml>=6", "ruff"]
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"

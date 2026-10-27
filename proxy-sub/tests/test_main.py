@@ -48,7 +48,7 @@ def test_build_subscription_filters_and_limits():
     configs = [main.parse_vless(VLESS), main.parse_vless(VLESS.replace(":443", ":9999").replace("uuid-1", "u2"))]
     text = main.build_subscription(configs, network="lte", max_configs=10)
     lines = [ln for ln in text.splitlines() if ln.startswith("vless://")]
-    assert len(lines) == 1 and lines[0].endswith(":443")
+    assert len(lines) == 1 and ":443?" in lines[0]
     assert "//profile-title: base64:" in text
 
 
